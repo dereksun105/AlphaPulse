@@ -19,8 +19,26 @@ supabase: Client = create_client(url, key)
 def mock_train_and_upload():
     print("Starting mock training session...")
     
+    # Get current max epoch to avoid duplicates in chart
+    try:
+        max_epoch_response = supabase.table("trader_growth_log") \
+            .select("epoch") \
+            .order("epoch", desc=True) \
+            .limit(1) \
+            .execute()
+        
+        start_epoch = 1
+        if max_epoch_response.data and len(max_epoch_response.data) > 0:
+            start_epoch = max_epoch_response.data[0]['epoch'] + 1
+            print(f"Resuming from epoch {start_epoch}...")
+            
+    except Exception as e:
+        print(f"Error fetching max epoch: {e}, starting from 1")
+        start_epoch = 1
+
     # Simulate a training loop where we get stats every "epoch"
-    for epoch in range(1, 6):
+    for i in range(5):
+        epoch = start_epoch + i
         # Simulate stats (Mocking PPO training metrics)
         sharpe_ratio = random.uniform(0.5, 2.5)
         mdd = random.uniform(0.05, 0.30)

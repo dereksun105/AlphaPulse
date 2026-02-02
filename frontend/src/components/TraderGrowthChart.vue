@@ -1,138 +1,163 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, onUnmounted } from 'vue'
-import { createChart, type ISeriesApi } from 'lightweight-charts'
-import { useGrowthStore } from '../stores/growthStore'
-import { storeToRefs } from 'pinia'
+import { ref, onMounted, onUnmounted } from 'vue';
+import { createChart, type ISeriesApi, type IChartApi, AreaSeries } from 'lightweight-charts';
+import { supabase } from '../supabase';
 
-const chartContainer = ref<HTMLElement | null>(null)
-let chart: any = null
-let rewardSeries: ISeriesApi<'Line'> | null = null
-let sharpeSeries: ISeriesApi<'Line'> | null = null
-let mddSeries: ISeriesApi<'Line'> | null = null
+// CRITICAL: Use plain variables for Chart instances, NOT Vue refs.
+// Vue proxies interfere with Lightweight Charts internal logic.
+// This follows the Official TradingView Vue.js Best Practices guide.
+let chart: IChartApi | null = null;
+let lineSeries: ISeriesApi<"Area"> | null = null;
 
-const growthStore = useGrowthStore()
-const { logs } = storeToRefs(growthStore)
+const chartContainer = ref<HTMLElement | null>(null);
+const latestStats = ref<any>(null);
+
+// Helper to convert epoch to a strict YYYY-MM-DD string
+function epochToDateString(epoch: number): string {
+  const date = new Date(2024, 0, 1);
+  date.setDate(date.getDate() + Number(epoch));
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  const dd = String(date.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+const resizeHandler = () => {
+    if (!chart || !chartContainer.value) return;
+    const { clientWidth } = chartContainer.value;
+    // Make chart responsive to window height (75% of viewport)
+    chart.applyOptions({ width: clientWidth, height: window.innerHeight * 0.75 });
+};
 
 onMounted(async () => {
-  await growthStore.fetchLogs()
-  growthStore.subscribeToLogs()
+  if (!chartContainer.value) return;
 
-  if (chartContainer.value) {
-    chart = createChart(chartContainer.value, {
-      width: chartContainer.value.clientWidth,
-      height: 400,
-      layout: {
-        background: { color: '#1E1E1E' },
-        textColor: '#DDD',
-      },
-      grid: {
-        vertLines: { color: '#2B2B2B' },
-        horzLines: { color: '#2B2B2B' },
-      },
-    })
+  // 1. Initialize Chart
+  chart = createChart(chartContainer.value, {
+    height: window.innerHeight * 0.75, 
+    width: chartContainer.value.clientWidth,
+    layout: { 
+        background: { color: '#1a1a1a' }, 
+        textColor: '#d1d4dc',
+    },
+    grid: { 
+        vertLines: { color: '#2b2b2b' }, 
+        horzLines: { color: '#2b2b2b' } 
+    },
+    timeScale: {
+      borderColor: '#2b2b2b',
+      timeVisible: true,
+    },
+    rightPriceScale: {
+      borderColor: '#2b2b2b',
+    },
+  });
 
-    rewardSeries = chart.addLineSeries({
-      color: '#4caf50',
-      title: 'Reward',
-      lineWidth: 2,
-    })
+  // 2. Add Series
+  lineSeries = chart.addSeries(AreaSeries, {
+    lineColor: '#2962FF', 
+    topColor: '#2962FF', 
+    bottomColor: 'rgba(41, 98, 255, 0.28)',
+    lineWidth: 2,
+  });
 
-    mddSeries = chart.addLineSeries({
-      color: '#ff5252',
-      title: 'MDD',
-      lineWidth: 2,
-      priceScaleId: 'right',
-    })
+  // 3. Fetch Initial Data
+  const { data } = await supabase
+    .from('trader_growth_log')
+    .select('*')
+    .order('epoch', { ascending: true });
 
-    sharpeSeries = chart.addLineSeries({
-      color: '#2196f3',
-      title: 'Sharpe Ratio',
-      lineWidth: 2,
-      priceScaleId: 'left', // Use left axis for Sharpe
-    })
+  if (data && data.length > 0) {
+    // Deduplicate and Sort
+    const uniqueMap = new Map();
+    data.forEach(d => uniqueMap.set(d.epoch, d));
+    const sortedData = Array.from(uniqueMap.values()).sort((a: any, b: any) => a.epoch - b.epoch);
+
+    const chartData = sortedData.map((d: any) => ({ 
+      time: epochToDateString(d.epoch), 
+      value: Number(d.reward) 
+    }));
+
+    lineSeries.setData(chartData);
+    latestStats.value = sortedData[sortedData.length - 1];
     
-    // Check if right axis is visible
-    chart.priceScale('right').applyOptions({
-         visible: true,
-         borderColor: '#2B2B2B'
-    });
-    
-    chart.priceScale('left').applyOptions({
-         visible: true,
-         borderColor: '#2B2B2B'
-    });
-
-    updateChart()
+    chart.timeScale().fitContent();
   }
-  
-  window.addEventListener('resize', handleResize)
-})
+
+  // 4. Realtime Subscription
+  supabase
+    .channel('growth-realtime')
+    .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'trader_growth_log' }, payload => {
+      const newLog = payload.new;
+      if (newLog && lineSeries) {
+        lineSeries.update({ 
+          time: epochToDateString(newLog.epoch), 
+          value: Number(newLog.reward) 
+        });
+        latestStats.value = newLog;
+      }
+    })
+    .subscribe();
+    
+    window.addEventListener('resize', resizeHandler);
+});
 
 onUnmounted(() => {
-    window.removeEventListener('resize', handleResize)
-    if (chart) {
-        chart.remove()
-    }
-})
-
-const handleResize = () => {
-    if (chart && chartContainer.value) {
-        chart.applyOptions({ width: chartContainer.value.clientWidth })
-    }
-}
-
-watch(logs, () => {
-  updateChart()
-}, { deep: true })
-
-function epochToDate(epoch: number): string {
-  // Mock date starting from 2024-01-01 plus epoch days
-  const date = new Date(2024, 0, 1)
-  date.setDate(date.getDate() + epoch)
-  return date.toISOString().split('T')[0] || ''
-}
-
-function updateChart() {
-  if (!chart || !rewardSeries || !sharpeSeries || !mddSeries) return
-  if (logs.value.length === 0) return
-
-  // sort logs by epoch
-  const sortedLogs = [...logs.value].sort((a, b) => a.epoch - b.epoch)
-  
-  const rewardData = sortedLogs.map(log => ({ time: epochToDate(log.epoch), value: log.reward }))
-  const sharpeData = sortedLogs.map(log => ({ time: epochToDate(log.epoch), value: log.sharpe_ratio }))
-  const mddData = sortedLogs.map(log => ({ time: epochToDate(log.epoch), value: log.mdd }))
-  
-  rewardSeries.setData(rewardData)
-  sharpeSeries.setData(sharpeData)
-  mddSeries.setData(mddData)
-  
-  chart.timeScale().fitContent()
-}
+  if (chart) {
+    chart.remove();
+    chart = null;
+  }
+  window.removeEventListener('resize', resizeHandler);
+});
 </script>
 
 <template>
-  <div class="chart-wrapper">
-    <h2>RL Agent Training Progress</h2>
-    <div ref="chartContainer" class="chart-container"></div>
+  <div class="growth-dashboard">
+    <h3>策略成長監控 (2026 準備計畫)</h3>
+    <div ref="chartContainer" class="tv-chart"></div>
+    <div class="metrics" v-if="latestStats">
+      <span>當前 Sharpe: <span class="highlight">{{ Number(latestStats.sharpe_ratio).toFixed(2) }}</span></span>
+      <span>當前 MDD: <span class="down">{{ (Number(latestStats.mdd) * 100).toFixed(2) }}%</span></span>
+      <span>回報: <span class="highlight">{{ Number(latestStats.reward).toFixed(2) }}</span></span>
+    </div>
+    <div class="metrics" v-else>
+      <span>等待數據中... (請執行 python/test_rl_upload.py)</span>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.chart-wrapper {
-  width: 100%;
-  padding: 20px;
-  background-color: #121212;
-  border-radius: 8px;
+.growth-dashboard { 
+  background: #111; 
+  padding: 20px; 
+  border-radius: 8px; 
+  border: 1px solid #333;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+  font-family: 'Inter', sans-serif;
 }
-
-h2 {
+.growth-dashboard h3 {
   color: #fff;
-  margin-bottom: 10px;
+  margin-top: 0;
+  margin-bottom: 20px;
+  font-weight: 600;
+  font-size: 1.1rem;
+  border-left: 4px solid #2962FF;
+  padding-left: 10px;
 }
-
-.chart-container {
-  width: 100%;
-  height: 400px;
+.tv-chart { 
+  width: 100%; 
+  height: 75vh;
 }
+.metrics { 
+  display: flex; 
+  gap: 20px; 
+  margin-top: 15px; 
+  color: #888; 
+  font-family: 'SF Mono', 'Roboto Mono', monospace; 
+  font-size: 0.9rem;
+  padding-top: 15px;
+  border-top: 1px solid #2b2b2b;
+}
+.highlight { color: #2962FF; font-weight: bold; }
+.down { color: #FF5252; font-weight: bold; }
 </style>
