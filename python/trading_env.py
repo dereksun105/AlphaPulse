@@ -99,50 +99,64 @@ class TradingEnv(gym.Env):
         # Balance was increased when we Sold Short. 
         # So Balance + (-10 * Price) correctly reduces Equity if Price goes up.
         
-        self.current_equity = self.balance + (self.positions * current_price)
-        self.peak_equity = max(self.peak_equity, self.current_equity)
-        
-        # Calculate Step Return (Change in Equity)
-        step_pnl = self.current_equity - prev_equity
-        
-        # --- USER'S REWARD LOGIC (SHARPE GUIDED) ---
-        reward = self._get_reward(step_pnl, action)
-        # -------------------------------------------
-        
-        # Track history for Volatility
-        pct_return = step_pnl / prev_equity if prev_equity != 0 else 0
-        self.recent_returns.append(pct_return)
-        if len(self.recent_returns) > self.returns_window:
-            self.recent_returns.pop(0)
 
+        # Update Equity
+        self.current_equity = self.balance + (self.positions * current_price)
+        
+        # Calculate Reward using User's Custom Logic
+        # We need bid_ask_spread for valid calculation. Assuming spread is roughly related to volatility or fixed
+        bid_ask_spread = current_price * 0.0002 # 0.02% spread estimate
+        reward = self._calculate_reward(action, current_price, bid_ask_spread)
+        
+        # Track history for internal Volatility (kept for legacy/logging if needed)
+        # _calculate_reward updates self.recent_returns
+        
         self.current_step += 1
         terminated = self.current_step >= len(self.df) - 1
         truncated = False
         
         return self._next_observation(), reward, terminated, truncated, {}
 
-    def _get_reward(self, step_pnl, action):
+    def _calculate_reward(self, action, current_price, bid_ask_spread):
         """
-        這段邏輯展現了 Derek 對於「期望值」與「風險控管」的洞察力
+        這段邏輯展現了 Derek 對於「期望值」與「風險控管」的實戰洞察
         """
-        # 1. 交易成本懲罰 (Trading Cost)
-        # 頻繁交易會被手續費吃掉利潤，這是新手最常犯的錯誤
-        fee_penalty = 0
-        if action in [1, 2, 3]:
-            fee_penalty = 5.0 # Fixed cost per trade or %
+        # 1. 模擬滑價 (Slippage) 與手續費
+        # 在高頻交易環境中，滑價是 Alpha 的殺手
+        # 我們假設滑價為價差的 50% (觸發市價單的代價)
+        slippage_cost = bid_ask_spread * 0.5 if action != 0 else 0
+        fee_rate = 0.0001  # 萬分之一手續費
+        transaction_cost = (current_price * fee_rate) + slippage_cost
 
-        # 2. 波動懲罰 (Volatility Penalty) -> 模擬夏普值的分母
-        # 我們希望 Agent 不只是賺錢，還要賺得「穩」
-        volatility = np.std(self.recent_returns) if len(self.recent_returns) > 5 else 0
-        risk_penalty = volatility * 1000.0 # 係數需要 Tuning
+        # 2. 計算原始盈虧 (PnL)
+        # 根據你的 position 狀態計算 (1: Long, -1: Short, 0: Flat)
+        last_price = self.df.iloc[self.current_step - 1]['close'] if self.current_step > 0 else current_price
+        raw_pnl = self.positions * (current_price - last_price)
+        
+        # 3. 風險調整後的回報 (Risk-Adjusted Reward)
+        # 我們不只獎勵賺錢，更要懲罰不穩定的波動
+        # 目標是對標優式冠軍施同學的 Sharpe Ratio 4.8 標竿
+        net_return = raw_pnl - transaction_cost
+        
+        # Ensure self.returns_history exists (we mapped it to self.recent_returns in __init__)
+        self.recent_returns.append(net_return)
+        
+        volatility_penalty = 0
+        if len(self.recent_returns) > 20:
+            # 懲罰標準差，鼓勵 Agent 尋找穩定的獲利模式
+            volatility_penalty = np.std(self.recent_returns[-20:]) * 0.1
+        
+        # 4. 回撤懲罰 (Drawdown Penalty)
+        # 優式看重在「不確定性中精準校正」的能力，巨大的回撤代表校正失敗
+        drawdown_penalty = 0
+        
+        self.peak_equity = max(self.peak_equity, self.current_equity)
+        
+        if self.current_equity < self.peak_equity:
+            drawdown = (self.peak_equity - self.current_equity) / (self.peak_equity + 1e-9)
+            drawdown_penalty = drawdown * 1.5 # 權重係數，反映對風險的厭惡
 
-        # 3. 回撤懲罰 (Drawdown Penalty)
-        # 這是優式資本極為看重的指標：MDD (Max Drawdown)
-        drawdown = (self.peak_equity - self.current_equity) / self.peak_equity
-        dd_penalty = drawdown * 100.0 
-
-        # Final Reward Logic:
-        # PnL - (Costs + Risk + Drawdown)
-        reward = step_pnl - fee_penalty - risk_penalty - dd_penalty
+        # 最終獎勵函數
+        reward = net_return - volatility_penalty - drawdown_penalty
         
         return reward
